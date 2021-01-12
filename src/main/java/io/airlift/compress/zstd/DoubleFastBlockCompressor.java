@@ -20,18 +20,22 @@ import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
 class DoubleFastBlockCompressor
         implements BlockCompressor
 {
-    private static final int MIN_MATCH = 3;
-    private static final int SEARCH_STRENGTH = 8;
-    private static final int REP_MOVE = Constants.REPEATED_OFFSET_COUNT - 1;
+    private static final int MIN_MATCH = 3; // 最小匹配长度
+    private static final int SEARCH_STRENGTH = 8;   // 1<<8=256, 距离上个anchor 256bytes以内ip每次+1,每多256,多加1
+    private static final int REP_MOVE = Constants.REPEATED_OFFSET_COUNT - 1;    // TODO:
 
+    // caller: ZstdFrameCompressor.compressBlock
+    // (inputBase, inputAddress, inputSize, context.sequenceStore, context.blockCompressionState, context.offsets, parameters);
+    // inputAddress为一个Block的地址
     public int compressBlock(Object inputBase, final long inputAddress, int inputSize, SequenceStore output, BlockCompressionState state, RepeatedOffsets offsets, CompressionParameters parameters)
     {
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
+        // 匹配长度,至少为4, Level3,匹配长度为5
 
-        // Offsets in hash tables are relative to baseAddress. Hash tables can be reused across calls to compressBlock as long as
-        // baseAddress is kept constant.
-        // We don't want to generate sequences that point before the current window limit, so we "filter" out all results from looking up in the hash tables
-        // beyond that point.
+        // Offsets in hash tables are relative to baseAddress.
+        // Hash tables can be reused across calls to compressBlock as long as baseAddress is kept constant.
+        // We don't want to generate sequences that point before the current window limit,
+        // so we "filter" out all results from looking up in the hash tables beyond that point.
         final long baseAddress = state.getBaseAddress();
         final long windowBaseAddress = baseAddress + state.getWindowBaseOffset();
 
@@ -42,21 +46,27 @@ class DoubleFastBlockCompressor
         int shortHashBits = parameters.getChainLog();
 
         final long inputEnd = inputAddress + inputSize;
+        // 指向一个Block的结尾
         final long inputLimit = inputEnd - SIZE_OF_LONG; // We read a long at a time for computing the hashes
+        // 每次要读一段long计算 hash,所以设定一个limit
 
-        long input = inputAddress;
-        long anchor = inputAddress;
+        long input = inputAddress;  // ip
+        long anchor = inputAddress; // 存储每次match的结束位置,也就是下一组literals+match的开头地址
 
         int offset1 = offsets.getOffset0();
         int offset2 = offsets.getOffset1();
+        // 把之前存的offset拿过来,可能是上一个block的,也可能是初始化为1,4,8的
 
         int savedOffset = 0;
 
         if (input - windowBaseAddress == 0) {
             input++;
-        }
-        int maxRep = (int) (input - windowBaseAddress);
+        }// 让input至少指向windowBaseAddress的下一位置
 
+        int maxRep = (int) (input - windowBaseAddress); // 允许的最大rep
+        // 不允许超过window的范围去寻找匹配
+
+        // offset超出的允许范围就归零,把之前的值先存下来
         if (offset2 > maxRep) {
             savedOffset = offset2;
             offset2 = 0;
@@ -84,12 +94,17 @@ class DoubleFastBlockCompressor
 
             if (offset1 > 0 && UNSAFE.getInt(inputBase, input + 1 - offset1) == UNSAFE.getInt(inputBase, input + 1)) {
                 // found a repeated sequence of at least 4 bytes, separated by offset1
+                // 从input+1的位置,与input+1-offset1的位置有一个INT大小的匹配
                 matchLength = count(inputBase, input + 1 + SIZE_OF_INT, inputEnd, input + 1 + SIZE_OF_INT - offset1) + SIZE_OF_INT;
+                // 从这个INT匹配后继续找匹配,计算matchLength
                 input++;
+                // 找到匹配,input指向下一个位置,
                 output.storeSequence(inputBase, anchor, (int) (input - anchor), 0, matchLength - MIN_MATCH);
+                //  void storeSequence(Object literalBase, long literalAddress, int literalLength, int offsetCode, int matchLengthBase)
             }
             else {
                 // check prefix long match
+                // 检查longHash表中存放的从当前位置读一个Long的64位串计算得到的Hash值的上一次出现的位置,
                 if (longMatchAddress > windowBaseAddress && UNSAFE.getLong(inputBase, longMatchAddress) == UNSAFE.getLong(inputBase, input)) {
                     matchLength = count(inputBase, input + SIZE_OF_LONG, inputEnd, longMatchAddress + SIZE_OF_LONG) + SIZE_OF_LONG;
                     offset = (int) (input - longMatchAddress);
@@ -101,12 +116,14 @@ class DoubleFastBlockCompressor
                 }
                 else {
                     // check prefix short match
+                    // 检查shortHash
                     if (shortMatchAddress > windowBaseAddress && UNSAFE.getInt(inputBase, shortMatchAddress) == UNSAFE.getInt(inputBase, input)) {
                         int nextOffsetHash = hash8(UNSAFE.getLong(inputBase, input + 1), longHashBits);
                         long nextOffsetMatchAddress = baseAddress + longHashTable[nextOffsetHash];
                         longHashTable[nextOffsetHash] = current + 1;
 
                         // check prefix long +1 match
+                        // 如果找到了短匹配先不存,看看ip+1位置有没有长匹配
                         if (nextOffsetMatchAddress > windowBaseAddress && UNSAFE.getLong(inputBase, nextOffsetMatchAddress) == UNSAFE.getLong(inputBase, input + 1)) {
                             matchLength = count(inputBase, input + 1 + SIZE_OF_LONG, inputEnd, nextOffsetMatchAddress + SIZE_OF_LONG) + SIZE_OF_LONG;
                             input++;
@@ -119,6 +136,7 @@ class DoubleFastBlockCompressor
                         }
                         else {
                             // if no long +1 match, explore the short match we found
+                            // 如果ip+1位置没有长匹配,则使用ip位置的短匹配,前后扩充下
                             matchLength = count(inputBase, input + SIZE_OF_INT, inputEnd, shortMatchAddress + SIZE_OF_INT) + SIZE_OF_INT;
                             offset = (int) (input - shortMatchAddress);
                             while (input > anchor && shortMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, shortMatchAddress - 1)) {
@@ -131,26 +149,35 @@ class DoubleFastBlockCompressor
                     else {
                         input += ((input - anchor) >> SEARCH_STRENGTH) + 1;
                         continue;
+                        // ip位置并没有找到任何匹配, ip往前走, 走多长与距离anchor中有多少个256bytes相关
+                        // 由于空间的局部性,我们认为一个匹配的附近往往有更多的匹配,所以走的细一点
                     }
                 }
 
+                
                 offset2 = offset1;
                 offset1 = offset;
+                // update offset 
 
                 output.storeSequence(inputBase, anchor, (int) (input - anchor), offset + REP_MOVE, matchLength - MIN_MATCH);
+                // void storeSequence(Object literalBase, long literalAddress, int literalLength, int offsetCode, int matchLengthBase)
             }
 
             input += matchLength;
             anchor = input;
+            // 上一个literals+match结束, 相应指针移动到新一个literals的位置
 
             if (input <= inputLimit) {
-                // Fill Table
+                // 把ip前后2位置的信息填到hash表中,为后面的寻找匹配做贡献
                 longHashTable[hash8(UNSAFE.getLong(inputBase, baseAddress + current + 2), longHashBits)] = current + 2;
                 shortHashTable[hash(inputBase, baseAddress + current + 2, shortHashBits, matchSearchLength)] = current + 2;
 
                 longHashTable[hash8(UNSAFE.getLong(inputBase, input - 2), longHashBits)] = (int) (input - 2 - baseAddress);
                 shortHashTable[hash(inputBase, input - 2, shortHashBits, matchSearchLength)] = (int) (input - 2 - baseAddress);
 
+                // 检查offset2
+                // 此时ip指向上一个match的结尾,如果存在一个新的match,那么literals_length=0,
+                // 反复检查offset1和2, 为什么是while而不是if呢,因为每次找到一个match会swap offset1和offset2, 所以循环检查
                 while (input <= inputLimit && offset2 > 0 && UNSAFE.getInt(inputBase, input) == UNSAFE.getInt(inputBase, input - offset2)) {
                     int repetitionLength = count(inputBase, input + SIZE_OF_INT, inputEnd, input + SIZE_OF_INT - offset2) + SIZE_OF_INT;
 
@@ -163,6 +190,7 @@ class DoubleFastBlockCompressor
                     longHashTable[hash8(UNSAFE.getLong(inputBase, input), longHashBits)] = (int) (input - baseAddress);
 
                     output.storeSequence(inputBase, anchor, 0, 0, repetitionLength - MIN_MATCH);
+                    // offset2找到的存 0,0,match_length-3
 
                     input += repetitionLength;
                     anchor = input;
@@ -183,6 +211,7 @@ class DoubleFastBlockCompressor
     /**
      * matchAddress must be < inputAddress
      */
+    // 统计inputAddress开始的内容与matchAddress开始的内容有多少个字节相匹配
     public static int count(Object inputBase, final long inputAddress, final long inputLimit, final long matchAddress)
     {
         long input = inputAddress;
@@ -192,17 +221,23 @@ class DoubleFastBlockCompressor
 
         // first, compare long at a time
         int count = 0;
+        // 以long为单位进行比较
         while (count < remaining - (SIZE_OF_LONG - 1)) {
             long diff = UNSAFE.getLong(inputBase, match) ^ UNSAFE.getLong(inputBase, input);
+            // 取两个long进行异或,为0则相等
             if (diff != 0) {
                 return count + (Long.numberOfTrailingZeros(diff) >> 3);
+                // numberOfTrailingZeros: 数一个long数据的在出现第一个1之前有几个0,全0则返回64
+                // 把这个结果整除8,即可得到有几个bytes匹配
             }
 
             count += SIZE_OF_LONG;
             input += SIZE_OF_LONG;
             match += SIZE_OF_LONG;
+            // 匹配了4bytes,全部前移
         }
 
+        // 当不够再读取一个long的时候到这里以字节为单位进行匹配
         while (count < remaining && UNSAFE.getByte(inputBase, match) == UNSAFE.getByte(inputBase, input)) {
             count++;
             input++;
@@ -212,6 +247,7 @@ class DoubleFastBlockCompressor
         return count;
     }
 
+    // matchSearchLength选择hash的类型,bits选择hash的位数
     private static int hash(Object inputBase, long inputAddress, int bits, int matchSearchLength)
     {
         switch (matchSearchLength) {
