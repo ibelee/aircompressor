@@ -26,7 +26,7 @@ class FseCompressionTable
     private final int[] deltaFindState;
 
     private int log2Size;
-    //
+    // tableLog
 
     // caller: newInstance()
     // 给几个表分配足够大的数组空间
@@ -113,7 +113,7 @@ class FseCompressionTable
         }
 
         // Build symbol transformation table
-        // fill in CTable2
+        // fill in SymbolTT
         int total = 0;
         for (int symbol = 0; symbol <= maxSymbol; symbol++) {
             switch (normalizedCounts[symbol]) {
@@ -137,23 +137,30 @@ class FseCompressionTable
         }
     }
 
-    // 这个begin没理解好,如何找到FSE压缩的初始状态么
+    // FSE初始化状态
     public int begin(byte symbol)
     {
         int outputBits = (deltaNumberOfBits[symbol] + (1 << 15)) >>> 16;
-        // 1000_0000_0000_0000 + deltaNumberOfBits[symbol], 
+        // deltaNumberOfBits[symbol]中存储的是这个symbol的 (n+1) << 16 - 分界线(bound)
+        // 1 << 15 是一个超过FSE支持最大的tableLog的状态值,也就是状态一定大于分界线,那得到的outputBits一定为这个符号的n+1
         int base = ((outputBits << 16) - deltaNumberOfBits[symbol]) >>> outputBits;
+        // (outputBits(上面求出来的n+1) << 16) - deltaNumberOfBits[symbol] = 分界线
         return nextState[base + deltaFindState[symbol]];
+        // 也就是用symbol的分界线作为初始状态对这个符号进行压缩,初始化,不用添加流
     }
 
-    // FSE compression
+    // FSE encode
     public int encode(BitOutputStream stream, int state, int symbol)
     {
         int outputBits = (state + deltaNumberOfBits[symbol]) >>> 16;
+        // 状态与分界线比较来确定是n还是n+1
         stream.addBits(state, outputBits);
+        // 状态的低outputBits位存入流
         return nextState[(state >>> outputBits) + deltaFindState[symbol]];
+        // 在状态表的子范围中寻找下一个状态
     }
 
+    // 把最后一个state的tableLog位全写入流
     public void finish(BitOutputStream stream, int state)
     {
         stream.addBits(state, log2Size);
@@ -185,6 +192,7 @@ class FseCompressionTable
                     position = (position + step) & mask;
                 }
                 while (position > highThreshold);
+                // lowProbCount = -1时,这个循环会用到
             }
         }
         return position;
