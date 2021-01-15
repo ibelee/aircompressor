@@ -33,6 +33,7 @@ import static io.airlift.compress.zstd.Util.checkArgument;
 
 class SequenceEncoder
 {
+    // 默认tableLog和默认分布表
     private static final int DEFAULT_LITERAL_LENGTH_NORMALIZED_COUNTS_LOG = 6;
     private static final short[] DEFAULT_LITERAL_LENGTH_NORMALIZED_COUNTS = {4, 3, 2, 2, 2, 2, 2, 2,
                                                                              2, 2, 2, 2, 2, 1, 1, 1,
@@ -59,6 +60,7 @@ class SequenceEncoder
     private static final FseCompressionTable DEFAULT_MATCH_LENGTHS_TABLE = FseCompressionTable.newInstance(DEFAULT_MATCH_LENGTH_NORMALIZED_COUNTS, MAX_MATCH_LENGTH_SYMBOL, DEFAULT_LITERAL_LENGTH_NORMALIZED_COUNTS_LOG);
     private static final FseCompressionTable DEFAULT_OFFSETS_TABLE = FseCompressionTable.newInstance(DEFAULT_OFFSET_NORMALIZED_COUNTS, DEFAULT_MAX_OFFSET_CODE_SYMBOL, DEFAULT_OFFSET_NORMALIZED_COUNTS_LOG);
 
+    // 构造函数
     private SequenceEncoder()
     {
     }
@@ -70,6 +72,7 @@ class SequenceEncoder
 
         checkArgument(outputLimit - output > 3 /* max sequence count Size */ + 1 /* encoding type flags */, "Output buffer too small");
 
+        // 根据sequenceCount的大小,写不同大小的SequenceHeader
         int sequenceCount = sequences.sequenceCount;
         if (sequenceCount < 0x7F) {
             UNSAFE.putByte(outputBase, output, (byte) sequenceCount);
@@ -102,6 +105,7 @@ class SequenceEncoder
         Histogram.count(sequences.literalLengthCodes, sequenceCount, workspace.counts);
         maxSymbol = Histogram.findMaxSymbol(counts, MAX_LITERALS_LENGTH_SYMBOL);
         largestCount = Histogram.findLargestCount(counts, maxSymbol);
+        // 统计literalLengthCodes数组到count表中
 
         int literalsLengthEncodingType = selectEncodingType(largestCount, sequenceCount, DEFAULT_LITERAL_LENGTH_NORMALIZED_COUNTS_LOG, true, strategy);
 
@@ -221,19 +225,23 @@ class SequenceEncoder
     {
         int tableLog = optimalTableLog(maxTableLog, sequenceCount, maxSymbol);
 
-        // this is a minor optimization. The last symbol is embedded in the initial FSE state, so it's not part of the bitstream. We can omit it from the
-        // statistics (but only if its count is > 1). This makes the statistics a tiny bit more accurate.
+        // this is a minor optimization. The last symbol is embedded in the initial FSE state, so it's not part of the bitstream.
+        // We can omit it from the statistics (but only if its count is > 1). This makes the statistics a tiny bit more accurate.
         if (counts[codes[sequenceCount - 1]] > 1) {
             counts[codes[sequenceCount - 1]]--;
             sequenceCount--;
         }
+        // FSE压缩最先使用最后一条sequence进行begin过程,这个是嵌入到FSE的状态中的,无需addbits的,
+        // 所以统计数据的时候把这个删掉的话,统计的更准确,要求这个符号至少出现2次才可以忽略掉最后一个
 
+        // 正规化,创建编码表,正规化数据写入流一条龙
         FiniteStateEntropy.normalizeCounts(normalizedCounts, tableLog, counts, sequenceCount, maxSymbol);
         table.initialize(normalizedCounts, maxSymbol, tableLog);
 
         return FiniteStateEntropy.writeNormalizedCounts(outputBase, output, (int) (outputLimit - output), normalizedCounts, maxSymbol, tableLog); // TODO: pass outputLimit directly
     }
 
+    // 把三个Code变为FSE流+length流交叉格式
     private static int encodeSequences(
             Object outputBase,
             long output,
@@ -252,10 +260,12 @@ class SequenceEncoder
         int sequenceCount = sequences.sequenceCount;
 
         // first symbols
+        // 因为begin过程不addbits,所以这个顺序乱了无所谓
         int matchLengthState = matchLengthTable.begin(matchLengthCodes[sequenceCount - 1]);
         int offsetState = offsetsTable.begin(offsetCodes[sequenceCount - 1]);
         int literalLengthState = literalLengthTable.begin(literalLengthCodes[sequenceCount - 1]);
 
+        // OML-LMO
         blockStream.addBits(sequences.literalLengths[sequenceCount - 1], LITERALS_LENGTH_BITS[literalLengthCodes[sequenceCount - 1]]);
         blockStream.addBits(sequences.matchLengths[sequenceCount - 1], MATCH_LENGTH_BITS[matchLengthCodes[sequenceCount - 1]]);
         blockStream.addBits(sequences.offsets[sequenceCount - 1], offsetCodes[sequenceCount - 1]);
@@ -267,6 +277,7 @@ class SequenceEncoder
                 byte offsetCode = offsetCodes[n];
                 byte matchLengthCode = matchLengthCodes[n];
 
+                // 每一个length对应一个Code和一个Bits, offset的code就是bits
                 int literalLengthBits = LITERALS_LENGTH_BITS[literalLengthCode];
                 int offsetBits = offsetCode;
                 int matchLengthBits = MATCH_LENGTH_BITS[matchLengthCode];
@@ -275,11 +286,13 @@ class SequenceEncoder
                 offsetState = offsetsTable.encode(blockStream, offsetState, offsetCode); // 15
                 matchLengthState = matchLengthTable.encode(blockStream, matchLengthState, matchLengthCode); // 24
                 literalLengthState = literalLengthTable.encode(blockStream, literalLengthState, literalLengthCode); // 33
+                // encode过程会将三个state的低位写入bits,顺序OML
 
                 if ((offsetBits + matchLengthBits + literalLengthBits >= 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG))) {
                     blockStream.flush();                                /* (7)*/
                 }
 
+                // 再把相应length的低位写入bits,顺序LMO
                 blockStream.addBits(sequences.literalLengths[n], literalLengthBits);
                 if (((literalLengthBits + matchLengthBits) > 24)) {
                     blockStream.flush();
@@ -295,6 +308,7 @@ class SequenceEncoder
             }
         }
 
+        // 把最后一个状态全写入
         matchLengthTable.finish(blockStream, matchLengthState);
         offsetsTable.finish(blockStream, offsetState);
         literalLengthTable.finish(blockStream, literalLengthState);
@@ -306,12 +320,13 @@ class SequenceEncoder
     }
 
     private static int selectEncodingType(
-            int largestCount,
-            int sequenceCount,
-            int defaultNormalizedCountsLog,
-            boolean isDefaultTableAllowed,
+            int largestCount,   // 出现频次最高的数量
+            int sequenceCount,  // seq数量
+            int defaultNormalizedCountsLog, // 默认Log长度
+            boolean isDefaultTableAllowed,  // 是否允许默认表
             CompressionParameters.Strategy strategy)
     {
+        // 所有符号都相等的情况,根据规模选择默认表或RLE
         if (largestCount == sequenceCount) { // => all entries are equal
             if (isDefaultTableAllowed && sequenceCount <= 2) {
                 /* Prefer set_basic over set_rle when there are 2 or fewer symbols,
